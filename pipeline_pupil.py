@@ -204,8 +204,7 @@ def run_pupil_pipeline(shared_state):
             print("   -> User requested stop. Terminating Pupil Player.")
             os.killpg(os.getpgid(pupil_process.pid), signal.SIGKILL)
             return None
-            
-        if "Export done: Exported" in line:
+        if "Export done:" in line:
             print("   ✅ Detected 'Export done' message!")
             export_confirmed = True
             break
