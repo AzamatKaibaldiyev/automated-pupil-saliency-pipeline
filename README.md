@@ -4,7 +4,7 @@ This repository contains a Python script (`pipeline_pupil.py`) that automates th
 
 The pipeline runs all processing (export, mapping, saliency generation) in a **background thread**. While the pipeline runs, it displays an **interactive "waiting room"** window, allowing the user to explore saliency concepts.
 
-Once processing is complete, the script presents a **final 2x2 analysis grid** comparing the generated human saliency map, a neural network (NN) model's prediction, the gaze scanpath, and a diverging difference map.
+Once processing is complete, the script presents a **final 2x2 analysis grid** comparing the generated human saliency map, a neural network (NN) model's prediction, the gaze scanpath, and a diverging difference map (Was changed for deformation map based on saliency).
 
 ## Features
 
