@@ -35,6 +35,8 @@ import numpy as np
 import pandas as pd
 from scipy import ndimage
 from scipy.stats import gaussian_kde
+from scipy.ndimage import map_coordinates, maximum_filter
+from scipy.interpolate import griddata
 
 # ==============================================================================
 # SECTION 1: PUPIL LABS EXPORT AUTOMATION
@@ -502,6 +504,150 @@ def create_kde_heatmap(x, y, w, h):
     positions = np.vstack([xx.ravel(), yy.ravel()]); values = np.vstack([x, y])
     kernel = gaussian_kde(values); density = kernel(positions).reshape(xx.shape)
     return cv2.resize(density, (w, h))
+
+
+# =============================================================================
+# SECTION 3.5: NEW IMAGE DEFORMATION CLASS
+# =============================================================================
+
+class SaliencyDeformer:
+    def __init__(self, image, saliency_map):
+        """
+        Initialize the deformer with an image and its saliency map.
+
+        Args:
+            image: RGB image (H, W, 3) with values in [0, 255] or [0, 1]
+            saliency_map: Grayscale saliency map (H, W) with values in [0, 1]
+        """
+        # Normalize image to [0, 1] if needed
+        if image.max() > 1:
+            self.image = image.astype(np.float32) / 255.0
+        else:
+            self.image = image.astype(np.float32)
+            
+        # Ensure saliency map is in [0, 1]
+        self.saliency = np.clip(saliency_map.astype(np.float32), 0, 1)
+        
+        # Resize saliency map to match image if needed
+        if self.saliency.shape != self.image.shape[:2]:
+            self.saliency = cv2.resize(self.saliency, 
+                                    (self.image.shape[1], self.image.shape[0]),
+                                    interpolation=cv2.INTER_LINEAR)
+        
+        self.height, self.width = self.image.shape[:2]
+    
+    def _interpolate_image(self, new_y, new_x):
+        """
+        Interpolate the image using the new coordinate mappings.
+        """
+        # Clamp coordinates to image bounds
+        new_y = np.clip(new_y, 0, self.height - 1)
+        new_x = np.clip(new_x, 0, self.width - 1)
+        
+        # Interpolate each channel
+        if len(self.image.shape) == 3:
+            deformed = np.zeros_like(self.image)
+            for c in range(self.image.shape[2]):
+                deformed[:, :, c] = map_coordinates(
+                    self.image[:, :, c], 
+                    [new_y, new_x], 
+                    order=1, 
+                    mode='reflect'
+                )
+        else:
+            deformed = map_coordinates(
+                self.image, 
+                [new_y, new_x], 
+                order=1, 
+                mode='reflect'
+            )
+        
+        return np.clip(deformed, 0, 1)
+    
+    def _find_local_saliency_centers(self, blur_sigma):
+        """
+        Find local centers of high saliency for each pixel.
+        This creates a field where each pixel points to its nearest high-saliency center.
+        """
+        # Smooth the saliency map more to find main centers
+        smoothed_saliency = ndimage.gaussian_filter(self.saliency, sigma=blur_sigma)
+        
+        # Find local maxima in the saliency map
+        local_maxima = maximum_filter(smoothed_saliency, size=int(blur_sigma * 2)) == smoothed_saliency
+        local_maxima = local_maxima & (smoothed_saliency > 0.3)  # Only significant maxima
+        
+        # Get coordinates of local maxima
+        max_coords = np.where(local_maxima)
+        max_y = max_coords[0]
+        max_x = max_coords[1]
+        max_values = smoothed_saliency[max_y, max_x]
+        
+        if len(max_y) == 0:
+            # Fallback to image center if no maxima found
+            print("⚠️ Deformation Warning: No strong saliency maxima found. Using image center.")
+            center_y = np.full((self.height, self.width), self.height // 2, dtype=np.float32)
+            center_x = np.full((self.height, self.width), self.width // 2, dtype=np.float32)
+            return center_y, center_x
+        
+        # Create coordinate grids
+        y_grid, x_grid = np.mgrid[0:self.height, 0:self.width]
+        
+        # For each pixel, find the nearest high-saliency center weighted by saliency value
+        # NOTE: This is a slow O(H*W*N_maxima) operation.
+        print(f"⏳ Calculating deformation field from {len(max_y)} saliency centers... (this may be slow)")
+        center_y = np.zeros((self.height, self.width), dtype=np.float32)
+        center_x = np.zeros((self.height, self.width), dtype=np.float32)
+        
+        for i in range(self.height):
+            for j in range(self.width):
+                # Calculate distance to all maxima
+                distances = np.sqrt((max_y - i)**2 + (max_x - j)**2)
+                
+                # Weight by saliency value and inverse distance
+                weights = max_values / (distances + 1e-6)
+                weights = weights / np.sum(weights)
+                
+                # Weighted average of center positions
+                center_y[i, j] = np.sum(weights * max_y)
+                center_x[i, j] = np.sum(weights * max_x)
+        
+        return center_y, center_x
+    
+    def zoom_deformation(self, zoom_strength=0.5, blur_sigma=5, local_centers=True):
+        """
+        Apply zoom effect to salient regions - expands high-saliency areas.
+
+        Args:
+            zoom_strength: How strong the zoom effect is (0.1 to 2.0)
+            blur_sigma: Gaussian blur for smoothing the deformation field
+            local_centers: If True, zoom around local saliency centers; if False, use global center
+        """
+        # Create smooth zoom field based on saliency
+        zoom_field = ndimage.gaussian_filter(self.saliency, sigma=blur_sigma)
+        zoom_field = zoom_field * zoom_strength + 1.0  # Base zoom of 1.0
+        
+        # Create coordinate grids
+        y, x = np.mgrid[0:self.height, 0:self.width]
+        
+        if local_centers:
+            # Find local centers of high saliency for each pixel
+            center_y, center_x = self._find_local_saliency_centers(blur_sigma * 2)
+        else:
+            # Use global image center
+            center_y = np.full_like(y, self.height // 2, dtype=np.float32)
+            center_x = np.full_like(x, self.width // 2, dtype=np.float32)
+        
+        # Calculate displacement from relevant centers
+        dy = y - center_y
+        dx = x - center_x
+        
+        # Apply zoom deformation
+        new_y = center_y + dy / zoom_field
+        new_x = center_x + dx / zoom_field
+        
+        # Interpolate the deformed image
+        deformed = self._interpolate_image(new_y, new_x)
+        return deformed
 
 
 # =============================================================================
@@ -1055,43 +1201,47 @@ def display_final_results_2x2(args, shared_state):
             elif scanpath_image is None: msg = "Reference image missing"
             cv2.putText(scanpath_resized_bl, msg, (15, 35), FONT, 0.8, (255, 255, 255), 2)
 
-        # --- 4. Create Bottom-Right Image (Diverging Difference Map) ---
+        # --- 4. Create Bottom-Right Image (Saliency Deformation) ---
         saliency_map_grey = cv2.imread("images/saliency_map_greyscale.jpg", cv2.IMREAD_GRAYSCALE)
-        model_prediction_grey = cv2.imread("images/model_prediction_greyscale.jpg", cv2.IMREAD_GRAYSCALE)
-        ref_image_for_diff = cv2.imread(args.ref_image)
+        ref_image_for_deform = cv2.imread(args.ref_image)
         
-        diff_map_resized = None # Initialize
-        if saliency_map_grey is not None and model_prediction_grey is not None and ref_image_for_diff is not None:
-            print("✅ Generating diverging difference map...")
-            h_ref, w_ref = ref_image_for_diff.shape[:2]
-            
-            saliency_map_grey_r = cv2.resize(saliency_map_grey, (w_ref, h_ref))
-            model_prediction_grey_r = cv2.resize(model_prediction_grey, (w_ref, h_ref))
-            
-            saliency_float = saliency_map_grey_r.astype(np.float32)
-            model_float = model_prediction_grey_r.astype(np.float32)
-            signed_diff = saliency_float - model_float
-            diff_map_norm = ((signed_diff + 255.0) / 510.0) * 255.0
-            diff_map_norm_u8 = diff_map_norm.astype(np.uint8)
-            
-            diff_map_color = cv2.applyColorMap(diff_map_norm_u8, cv2.COLORMAP_JET)
-            diff_map_image = cv2.addWeighted(ref_image_for_diff, 0.5, diff_map_color, 0.5, 0)
-            
-            cv2.putText(diff_map_image, "Difference Map", (15, 35), FONT, 0.8, (255, 255, 255), 2)
-            cv2.putText(diff_map_image, "Red = You, Blue = Model", (15, 70), FONT, 0.7, (255, 255, 255), 2)
+        deformed_map_resized = None # Initialize
+        if saliency_map_grey is not None and ref_image_for_deform is not None:
+            print("✅ Generating saliency-based deformation map... (This may take a moment)")
+            try:
+                # Normalize saliency map to [0, 1] for the deformer
+                saliency_map_norm = saliency_map_grey.astype(np.float32) / 255.0
+                
+                # Instantiate the deformer
+                deformer = SaliencyDeformer(ref_image_for_deform, saliency_map_norm)
+                
+                # Run the deformation (this is the slow part)
+                deformed_image_float = deformer.zoom_deformation(zoom_strength=0.8, local_centers=True)
+                
+                # Convert back to [0, 255] uint8 for display
+                deformed_image_u8 = (np.clip(deformed_image_float, 0, 1) * 255).astype(np.uint8)
+                
+                cv2.putText(deformed_image_u8, "Saliency-Based Deformation", (15, 35), FONT, 0.8, (255, 255, 255), 2)
+                cv2.putText(deformed_image_u8, "Areas you viewed are magnified", (15, 70), FONT, 0.7, (255, 255, 255), 2)
 
-            diff_map_resized = cv2.resize(diff_map_image, (w_new_model, h_main)) # Resize to top-right
+                # Resize to match the top-right panel
+                deformed_map_resized = cv2.resize(deformed_image_u8, (w_new_model, h_main))
+                print("✅ Deformation complete.")
+            except Exception as e:
+                print(f"❌ Error during saliency deformation: {e}")
+                deformed_map_resized = np.zeros((h_main, w_new_model, 3), dtype=np.uint8)
+                cv2.putText(deformed_map_resized, "Deformation Failed", (15, 35), FONT, 0.8, (0, 0, 255), 2)
         else:
-            print("⚠️ Warning: Could not generate difference map.")
-            diff_map_resized = np.zeros((h_main, w_new_model, 3), dtype=np.uint8)
-            msg = "Difference map failed"
+            print("⚠️ Warning: Could not generate deformation map (missing inputs).")
+            deformed_map_resized = np.zeros((h_main, w_new_model, 3), dtype=np.uint8)
+            msg = "Deformation map failed"
             if saliency_map_grey is None: msg = "Missing 'saliency_map_greyscale.jpg'"
-            elif model_prediction_grey is None: msg = "Missing 'model_prediction_greyscale.jpg'"
-            cv2.putText(diff_map_resized, msg, (15, 35), FONT, 0.8, (255, 255, 255), 2)
+            elif ref_image_for_deform is None: msg = "Missing reference image"
+            cv2.putText(deformed_map_resized, msg, (15, 35), FONT, 0.8, (255, 255, 255), 2)
         
         # --- 5. Assemble Final 2x2 Grid ---
         top_row = np.hstack((saliency_map, model_prediction_resized))
-        bottom_row = np.hstack((scanpath_resized_bl, diff_map_resized)) 
+        bottom_row = np.hstack((scanpath_resized_bl, deformed_map_resized)) 
         full_composite_image = np.vstack((top_row, bottom_row))
 
         # --- 6. Resize the final composite image to fit the screen ---
